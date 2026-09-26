@@ -1,0 +1,282 @@
+# analyze_kmeans.py
+
+import torch
+import numpy as np
+import random
+from collections import Counter
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+import data
+from model import PolynomialODE
+from train import train_pnode
+from configs import problem_configs
+
+# ----------------------------
+# config
+# ----------------------------
+DATA_PATH = "sweep_degree2.pt"
+N_CLUSTERS = 2
+RANDOM_STATE = 0
+MIDPOINT_TESTS_PER_CLUSTER = 5   # how many random midpoint tests per cluster
+ACCURACY_THRESHOLD = 1e-3        # same logic as sweep
+
+# ----------------------------
+# load sweep data
+# ----------------------------
+obj = torch.load(DATA_PATH, map_location="cpu")
+records = obj["records"]
+meta = obj["meta"]
+
+problem_name = meta["problem"]
+degree = meta["degree"]
+
+# map name -> function
+name_to_problem = {
+    "linear": data.linear,
+    "damped": data.damped,
+    "van_der_pol": data.van_der_pol,
+    "rayleigh": data.rayleigh,
+    "pitchfork": data.pitchfork,
+    "lorenz": data.lorenz,
+    "pendulum": data.pendulum,
+    "sine_oscillator": data.sine_oscillator,
+    "duffing": data.duffing,
+    "lotka_volterra": data.lotka_volterra,
+    "soft_nonlinear": data.soft_nonlinear,
+    "quartic_duffing": data.quartic_duffing,
+}
+
+problem_fn = name_to_problem[problem_name]
+cfg = problem_configs[problem_fn]
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print("Problem:", problem_name)
+print("Degree:", degree)
+print("Device:", device)
+
+# ----------------------------
+# reconstruct training data (same as sweep)
+# ----------------------------
+
+t0, t1, N = cfg["t0"], cfg["t1"], cfg["N"]
+input_dim = cfg["input_dim"]
+output_dim = cfg["output_dim"]
+method = cfg["method"]
+lr = cfg["lr"]
+noise_level = cfg["noise_level"]
+to_normalize = cfg["to_normalize"]
+
+y0s = torch.stack(cfg["initial_conditions"]).to(device)
+t_train = torch.linspace(t0, t1, N, device=device)
+
+true_ys = []
+for y0 in y0s:
+    _, y = data.gen_trajectory(
+        t0=t0, t1=t1, steps=N,
+        y0=y0, device=device,
+        problem=problem_fn
+    )
+    true_ys.append(y)
+true_ys = torch.stack(true_ys, dim=0)
+
+scale = None
+if to_normalize:
+    scale = true_ys.abs().amax(dim=(0, 1)).clamp(min=1e-8)
+    true_ys = true_ys / scale
+    y0s = y0s / scale
+
+with torch.no_grad():
+    std = noise_level * true_ys.abs().mean()
+    noise = std * torch.randn_like(true_ys)
+    true_ys_noisy = true_ys + noise
+
+# ----------------------------
+# extract flattened weights
+# ----------------------------
+
+X = []
+labels = []
+
+for r in records:
+    init_w = r["init_weights"]
+    flat_parts = []
+
+    for k in sorted(init_w.keys()):
+        if k.endswith(".W"):
+            flat_parts.append(init_w[k].reshape(-1).numpy())
+
+    X.append(np.concatenate(flat_parts))
+    labels.append(r["label"])
+
+X = np.stack(X, axis=0)
+labels = np.array(labels)
+
+print("data matrix shape:", X.shape)
+print("label counts:", Counter(labels))
+
+# ----------------------------
+# standardize + PCA
+# ----------------------------
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+pca = PCA(n_components=20, whiten=True, random_state=RANDOM_STATE)
+X_pca = pca.fit_transform(X_scaled)
+
+print("PCA explained variance:", pca.explained_variance_ratio_.sum())
+
+# ----------------------------
+# KMeans
+# ----------------------------
+
+kmeans = KMeans(
+    n_clusters=N_CLUSTERS,
+    n_init=50,
+    random_state=RANDOM_STATE
+)
+
+cluster_ids = kmeans.fit_predict(X_pca)
+
+print("\nCluster composition:")
+for k in range(N_CLUSTERS):
+    idx = np.where(cluster_ids == k)[0]
+    counts = Counter(labels[idx])
+    print(f"\nCluster {k} size={len(idx)}")
+    for lab, cnt in counts.items():
+        print(f"  {lab:12s}: {cnt} ({cnt/len(idx):.2%})")
+
+# ----------------------------
+# utility: load flat weights
+# ----------------------------
+
+def load_flat_weights_into_model(model, flat_vec, template_init_weights):
+
+    offset = 0
+    keys = sorted([k for k in template_init_weights.keys() if k.endswith(".W")])
+    linears = [m for m in model.net if isinstance(m, torch.nn.Linear)]
+
+    for layer_idx, key in enumerate(keys):
+        W_template = template_init_weights[key]
+        shape = W_template.shape
+        size = W_template.numel()
+
+        slice_vec = flat_vec[offset:offset + size]
+        slice_tensor = torch.tensor(slice_vec, dtype=torch.float32).reshape(shape)
+
+        linears[layer_idx].weight.data.copy_(slice_tensor.to(device))
+        offset += size
+
+    assert offset == len(flat_vec)
+
+# ----------------------------
+# midpoint experiment
+# ----------------------------
+"""
+print("\n--- MIDPOINT EXPERIMENT (10 trials per cluster) ---")
+
+MIDPOINT_TRIALS = 10
+ACCURACY_THRESHOLD = 1e-3
+
+for k in range(N_CLUSTERS):
+
+    idx = np.where(cluster_ids == k)[0]
+
+    if len(idx) < 2:
+        continue
+
+    print(f"\nCluster {k} (size={len(idx)})")
+
+    n_success = 0
+    n_nonacc = 0
+    n_failed = 0
+
+    for trial in range(MIDPOINT_TRIALS):
+
+        i1, i2 = random.sample(list(idx), 2)
+
+        w1 = X[i1]
+        w2 = X[i2]
+        midpoint = 0.5 * (w1 + w2)
+
+        model = PolynomialODE(
+            input_dim=input_dim,
+            hidden_dims=[40, 40],
+            degree=degree,
+            output_dim=output_dim
+        ).to(device)
+
+        load_flat_weights_into_model(
+            model,
+            midpoint,
+            records[i1]["init_weights"]
+        )
+
+        try:
+            model, loss_history, _ = train_pnode(
+                model,
+                y0s,
+                t_train,
+                true_ys_noisy,
+                method=method,
+                device=device,
+                lr=lr,
+                epochs=1000
+            )
+
+            final_loss = loss_history[-1]
+
+            if final_loss < ACCURACY_THRESHOLD:
+                n_success += 1
+                outcome = "accurate"
+            else:
+                n_nonacc += 1
+                outcome = "non_accurate"
+
+        except Exception as e:
+            # solver underflow or numerical explosion
+            n_failed += 1
+            outcome = "failed"
+
+        print(f"  trial {trial+1:2d}: {outcome}")
+
+    print("\n  Summary:")
+    print(f"    accurate     : {n_success}")
+    print(f"    non_accurate : {n_nonacc}")
+    print(f"    failed       : {n_failed}")
+"""
+
+# ----------------------------
+# pick closest points to centroid (no extra runs)
+# ----------------------------
+
+TOPK = 10
+ONLY_NONFAILED = False   # set True if you want to ignore failed runs
+
+for k in range(N_CLUSTERS):
+    idx = np.where(cluster_ids == k)[0]
+
+    if ONLY_NONFAILED:
+        idx = idx[labels[idx] != "failed"]
+
+    if len(idx) == 0:
+        print(f"\nCluster {k}: no points (after filtering)")
+        continue
+
+    center = kmeans.cluster_centers_[k]  # centroid in PCA space
+    dists = np.linalg.norm(X_pca[idx] - center, axis=1)
+
+    order = np.argsort(dists)
+    chosen = idx[order[:min(TOPK, len(idx))]]
+
+    print(f"\nCluster {k}: closest {len(chosen)} runs to centroid (PCA-space distance)")
+    print("  indices:", chosen.tolist())
+    print("  labels :", [str(labels[i]) for i in chosen])
+    print("  dists  :", [float(dists[order[j]]) for j in range(len(chosen))])
+
+    # quick label summary for just these chosen ones
+    counts = Counter(labels[chosen])
+    print("  label counts among closest:", dict(counts))
